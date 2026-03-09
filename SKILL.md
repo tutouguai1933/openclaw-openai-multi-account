@@ -47,6 +47,15 @@ List current snapshots:
 python3 scripts/openclaw-openai-accounts.py list
 ```
 
+> `list`, `add`, `use`, `auto`, and `cron-check` all reconcile the **current live OpenClaw login** back into the saved account list before reporting or switching, so out-of-band `openclaw models auth login --provider openai-codex` changes are picked up automatically.
+>
+> The same reconciliation also keeps related OpenClaw auth metadata in sync:
+>
+> - add missing `auth.profiles` email aliases in `openclaw.json`
+> - keep `auth.order.openai-codex` aligned with the saved account list and current active account
+> - add/remove matching named email profiles in each agent `auth-profiles.json`
+> - prune stale aliases that no longer correspond to any saved account
+
 Probe real quota via Codex CLI and show it in the list:
 
 ```bash
@@ -122,20 +131,40 @@ python3 scripts/openclaw-openai-accounts.py auto --json
 
 A good interval is every 10-15 minutes.
 
+For unattended auto-switching, prefer a two-stage threshold with a short inactivity guard. The bundled script now supports:
+
+```bash
+python3 scripts/openclaw-openai-accounts.py auto --five-hour-switch-at 80 --five-hour-hard-switch-at 90 --weekly-switch-at 90 --weekly-hard-switch-at 95 --inactive-minutes 3
+python3 scripts/openclaw-openai-accounts.py cron-check --five-hour-switch-at 80 --five-hour-hard-switch-at 90 --weekly-switch-at 90 --weekly-hard-switch-at 95 --inactive-minutes 3
+```
+
+This means:
+
+- when 5-hour usage reaches **80%** (about 20% left), attempt switching only if no non-cron session across configured agents has been active within the last **3 minutes**
+- when 5-hour usage reaches **90%** (about 10% left), switch **immediately** to avoid hitting rate limits, even if sessions are active
+- when weekly usage reaches **90%** (about 10% left for the week), attempt switching only if no non-cron session across configured agents has been active within the last **3 minutes**
+- when weekly usage reaches **95%** (about 5% left for the week), switch **immediately** to preserve the remaining weekly quota
+
 ## Recommended policy
 
 Use this policy by default:
 
-- Check every 15 minutes
-- Switch only when the current account is close to exhaustion
-- Prefer staying on the current account if it is still under threshold
+- Check every 10 minutes
+- At 5-hour usage **80%**: try switching only when all non-cron sessions have been inactive for 3 minutes
+- At 5-hour usage **90%**: switch immediately to avoid rate limits
+- At weekly usage **90%**: try switching only when all non-cron sessions have been inactive for 3 minutes
+- At weekly usage **95%**: switch immediately to preserve the remaining weekly quota
+- Prefer staying on the current account if it is still under both soft thresholds
 - Prefer same-model account rotation (`openai-codex/gpt-5.4` → another `openai-codex/gpt-5.4` account)
 - Fall back to a backup model only when all accounts are above threshold or quota is unknown
 
 Default thresholds in the script:
 
-- 5-hour switch threshold: `85%`
-- weekly switch threshold: `90%`
+- 5-hour soft switch threshold: `80%`
+- 5-hour hard switch threshold: `90%`
+- weekly soft switch threshold: `90%`
+- weekly hard switch threshold: `95%`
+- inactivity guard: `3` minutes
 
 ## Recommended workflow
 
@@ -177,6 +206,7 @@ This skill now mirrors that model:
 - snapshots keep a stable email-based identity instead of relying on ambiguous `:default`
 - switching rewrites `:default` across all agents while also retaining/upserting the email-specific profile entry
 - metadata migration repairs older snapshot records that incorrectly treated `:default` as a unique account id
+- **email is the canonical human identity** for deduplication; `accountId` may change when the same email moves to a different workspace/team, so same-email re-logins update the existing saved account instead of creating a duplicate
 
 ## Notes
 

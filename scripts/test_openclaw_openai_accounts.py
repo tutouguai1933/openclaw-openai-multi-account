@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -472,10 +473,346 @@ def test_probe_forces_fresh_quota_refresh() -> None:
         env.cleanup()
 
 
+def test_auto_blocks_switch_when_recent_sessions_are_active() -> None:
+    env = TestEnv()
+    try:
+        env.build_fixture()
+        write_json(
+            env.state / "agents" / "main" / "sessions" / "sessions.json",
+            {
+                "agent:main:main": {
+                    "sessionId": "session-main",
+                    "updatedAt": int(time.time() * 1000),
+                    "model": "openai-codex/gpt-5.4",
+                }
+            },
+        )
+        write_json(
+            env.state / "openai-codex-accounts" / "profiles" / ".account2.quota.json",
+            {
+                "rate_limits": {
+                    "primary": {"used_percent": 10.0, "window_minutes": 300},
+                    "secondary": {"used_percent": 10.0, "window_minutes": 10080},
+                },
+                "cached_at": 1,
+                "health": {"status": "healthy", "reason": "cached-rate-limits"},
+            },
+        )
+        write_json(
+            env.state / "openai-codex-accounts" / "profiles" / ".account3.quota.json",
+            {
+                "rate_limits": {
+                    "primary": {"used_percent": 85.0, "window_minutes": 300},
+                    "secondary": {"used_percent": 20.0, "window_minutes": 10080},
+                },
+                "cached_at": 1,
+                "health": {"status": "healthy", "reason": "cached-rate-limits"},
+            },
+        )
+        meta_path = env.state / "openai-codex-accounts" / "accounts.json"
+        meta = read_json(meta_path)
+        meta["active"] = "account3"
+        write_json(meta_path, meta)
+
+        main_store_path = env.state / "agents" / "main" / "agent" / "auth-profiles.json"
+        worker_store_path = env.state / "agents" / "worker" / "agent" / "auth-profiles.json"
+        main_store = read_json(main_store_path)
+        worker_store = read_json(worker_store_path)
+        gamma_profile = main_store["profiles"]["openai-codex:gamma@example.com"]
+        main_store["profiles"]["openai-codex:default"] = gamma_profile
+        worker_store["profiles"]["openai-codex:default"] = gamma_profile
+        write_json(main_store_path, main_store)
+        write_json(worker_store_path, worker_store)
+
+        blocked = env.run("auto", "--json", "--inactive-minutes", "15", "--five-hour-hard-switch-at", "99")
+        payload = json.loads(blocked.stdout)
+        meta_after = read_json(meta_path)
+        main_store_after = read_json(main_store_path)
+        require(payload["mode"] == "blocked-active-sessions", f"expected switch to be blocked by active sessions, got {payload}")
+        require(payload["activeAccount"] == "account3", f"blocked result should preserve current active account, got {payload}")
+        require(payload["activeSessionCount"] >= 1, f"blocked result should report active sessions, got {payload}")
+        require(meta_after["active"] == "account3", f"meta active should remain unchanged when blocked, got {meta_after}")
+        require(main_store_after["profiles"]["openai-codex:default"]["access"] == gamma_profile["access"], "blocked switch must not rewrite live default token")
+    finally:
+        env.cleanup()
+
+
+def test_auto_forces_immediate_switch_at_hard_five_hour_threshold() -> None:
+    env = TestEnv()
+    try:
+        env.build_fixture()
+        write_json(
+            env.state / "agents" / "main" / "sessions" / "sessions.json",
+            {
+                "agent:main:main": {
+                    "sessionId": "session-main",
+                    "updatedAt": int(time.time() * 1000),
+                    "model": "openai-codex/gpt-5.4",
+                }
+            },
+        )
+        write_json(
+            env.state / "openai-codex-accounts" / "profiles" / ".account2.quota.json",
+            {
+                "rate_limits": {
+                    "primary": {"used_percent": 10.0, "window_minutes": 300},
+                    "secondary": {"used_percent": 10.0, "window_minutes": 10080},
+                },
+                "cached_at": 1,
+                "health": {"status": "healthy", "reason": "cached-rate-limits"},
+            },
+        )
+        write_json(
+            env.state / "openai-codex-accounts" / "profiles" / ".account3.quota.json",
+            {
+                "rate_limits": {
+                    "primary": {"used_percent": 96.0, "window_minutes": 300},
+                    "secondary": {"used_percent": 20.0, "window_minutes": 10080},
+                },
+                "cached_at": 1,
+                "health": {"status": "healthy", "reason": "cached-rate-limits"},
+            },
+        )
+        meta_path = env.state / "openai-codex-accounts" / "accounts.json"
+        meta = read_json(meta_path)
+        meta["active"] = "account3"
+        write_json(meta_path, meta)
+
+        main_store_path = env.state / "agents" / "main" / "agent" / "auth-profiles.json"
+        worker_store_path = env.state / "agents" / "worker" / "agent" / "auth-profiles.json"
+        main_store = read_json(main_store_path)
+        worker_store = read_json(worker_store_path)
+        gamma_profile = main_store["profiles"]["openai-codex:gamma@example.com"]
+        beta_profile = main_store["profiles"]["openai-codex:beta@example.com"]
+        main_store["profiles"]["openai-codex:default"] = gamma_profile
+        worker_store["profiles"]["openai-codex:default"] = gamma_profile
+        write_json(main_store_path, main_store)
+        write_json(worker_store_path, worker_store)
+
+        forced = env.run("auto", "--json", "--inactive-minutes", "3")
+        payload = json.loads(forced.stdout)
+        meta_after = read_json(meta_path)
+        main_store_after = read_json(main_store_path)
+        require(payload["mode"] == "account", f"hard threshold should force account switch, got {payload}")
+        require(payload["activeAccount"] == "account2", f"hard threshold should switch to best healthy account, got {payload}")
+        require(payload["forcedImmediate"] is True, f"hard threshold result should be marked forcedImmediate, got {payload}")
+        require(meta_after["active"] == "account2", f"meta active should update after forced switch, got {meta_after}")
+        require(main_store_after["profiles"]["openai-codex:default"]["access"] == beta_profile["access"], "hard threshold should rewrite live default token immediately")
+    finally:
+        env.cleanup()
+
+
+def test_auto_forces_immediate_switch_at_hard_weekly_threshold() -> None:
+    env = TestEnv()
+    try:
+        env.build_fixture()
+        write_json(
+            env.state / "agents" / "main" / "sessions" / "sessions.json",
+            {
+                "agent:main:main": {
+                    "sessionId": "session-main",
+                    "updatedAt": int(time.time() * 1000),
+                    "model": "openai-codex/gpt-5.4",
+                }
+            },
+        )
+        write_json(
+            env.state / "openai-codex-accounts" / "profiles" / ".account2.quota.json",
+            {
+                "rate_limits": {
+                    "primary": {"used_percent": 10.0, "window_minutes": 300},
+                    "secondary": {"used_percent": 10.0, "window_minutes": 10080},
+                },
+                "cached_at": 1,
+                "health": {"status": "healthy", "reason": "cached-rate-limits"},
+            },
+        )
+        write_json(
+            env.state / "openai-codex-accounts" / "profiles" / ".account3.quota.json",
+            {
+                "rate_limits": {
+                    "primary": {"used_percent": 70.0, "window_minutes": 300},
+                    "secondary": {"used_percent": 96.0, "window_minutes": 10080},
+                },
+                "cached_at": 1,
+                "health": {"status": "healthy", "reason": "cached-rate-limits"},
+            },
+        )
+        mock_usage = read_json(env.mock_rate_limits_path)
+        mock_usage.setdefault("by_email", {})["gamma@example.com"] = {
+            "primary": {"used_percent": 70.0, "window_minutes": 300, "resets_at": 1234567999},
+            "secondary": {"used_percent": 96.0, "window_minutes": 10080, "resets_at": 2234567999},
+        }
+        write_json(env.mock_rate_limits_path, mock_usage)
+        meta_path = env.state / "openai-codex-accounts" / "accounts.json"
+        meta = read_json(meta_path)
+        meta["active"] = "account3"
+        write_json(meta_path, meta)
+
+        main_store_path = env.state / "agents" / "main" / "agent" / "auth-profiles.json"
+        worker_store_path = env.state / "agents" / "worker" / "agent" / "auth-profiles.json"
+        main_store = read_json(main_store_path)
+        worker_store = read_json(worker_store_path)
+        gamma_profile = main_store["profiles"]["openai-codex:gamma@example.com"]
+        beta_profile = main_store["profiles"]["openai-codex:beta@example.com"]
+        main_store["profiles"]["openai-codex:default"] = gamma_profile
+        worker_store["profiles"]["openai-codex:default"] = gamma_profile
+        write_json(main_store_path, main_store)
+        write_json(worker_store_path, worker_store)
+
+        forced = env.run("auto", "--json", "--inactive-minutes", "3")
+        payload = json.loads(forced.stdout)
+        meta_after = read_json(meta_path)
+        main_store_after = read_json(main_store_path)
+        require(payload["mode"] == "account", f"hard weekly threshold should force account switch, got {payload}")
+        require(payload["activeAccount"] == "account2", f"hard weekly threshold should switch to best healthy account, got {payload}")
+        require(payload["forcedImmediate"] is True, f"hard weekly threshold result should be marked forcedImmediate, got {payload}")
+        require(payload["forcedBy"] == "weekly", f"hard weekly threshold should be marked forcedBy=weekly, got {payload}")
+        require(meta_after["active"] == "account2", f"meta active should update after forced weekly switch, got {meta_after}")
+        require(main_store_after["profiles"]["openai-codex:default"]["access"] == beta_profile["access"], "hard weekly threshold should rewrite live default token immediately")
+    finally:
+        env.cleanup()
+
+
+def test_sync_new_email_same_account_id_auto_enrolls_new_account() -> None:
+    env = TestEnv()
+    try:
+        env.build_fixture()
+        new_profile = {
+            "type": "oauth",
+            "provider": "openai-codex",
+            "access": make_jwt("delta@example.com", "acct-gamma", "user-delta"),
+            "refresh": "refresh-delta",
+            "accountId": "acct-gamma",
+            "expires": 2_000_000_000_999,
+        }
+        main_store_path = env.state / "agents" / "main" / "agent" / "auth-profiles.json"
+        worker_store_path = env.state / "agents" / "worker" / "agent" / "auth-profiles.json"
+        main_store = read_json(main_store_path)
+        worker_store = read_json(worker_store_path)
+        main_store["profiles"]["openai-codex:default"] = new_profile
+        worker_store["profiles"]["openai-codex:default"] = new_profile
+        write_json(main_store_path, main_store)
+        write_json(worker_store_path, worker_store)
+
+        payload = json.loads(env.run("list", "--json").stdout)
+        meta = read_json(env.state / "openai-codex-accounts" / "accounts.json")
+        snap = read_json(env.state / "openai-codex-accounts" / "profiles" / "account4.json")
+        cfg = read_json(env.state / "openclaw.json")
+        main_store = read_json(env.state / "agents" / "main" / "agent" / "auth-profiles.json")
+
+        require(payload["active"] == "account4", f"new email should auto-enroll as account4, got {payload}")
+        require(meta["active"] == "account4", f"meta active should point to new email account, got {meta}")
+        require(meta["accounts"]["account4"]["email"] == "delta@example.com", f"new auto-enrolled email missing: {meta}")
+        require(snap["access"] == new_profile["access"], "auto-enrolled snapshot should mirror current live token")
+        require("openai-codex:delta@example.com" in (cfg.get("auth", {}).get("profiles", {}) or {}), f"config auth.profiles should add delta alias: {cfg}")
+        require("openai-codex:delta@example.com" in ((cfg.get("auth", {}).get("order", {}) or {}).get("openai-codex", [])), f"config auth.order should include delta alias: {cfg}")
+        require("openai-codex:delta@example.com" in (main_store.get("profiles", {}) or {}), f"auth store should add delta alias: {main_store}")
+    finally:
+        env.cleanup()
+
+
+def test_sync_same_email_updates_existing_account_without_duplicate() -> None:
+    env = TestEnv()
+    try:
+        env.build_fixture()
+        refreshed_beta = {
+            "type": "oauth",
+            "provider": "openai-codex",
+            "access": make_jwt("beta@example.com", "acct-beta-2", "user-beta-2"),
+            "refresh": "refresh-beta-2",
+            "accountId": "acct-beta-2",
+            "expires": 2_000_000_001_111,
+        }
+        main_store_path = env.state / "agents" / "main" / "agent" / "auth-profiles.json"
+        worker_store_path = env.state / "agents" / "worker" / "agent" / "auth-profiles.json"
+        main_store = read_json(main_store_path)
+        worker_store = read_json(worker_store_path)
+        main_store["profiles"]["openai-codex:default"] = refreshed_beta
+        worker_store["profiles"]["openai-codex:default"] = refreshed_beta
+        write_json(main_store_path, main_store)
+        write_json(worker_store_path, worker_store)
+
+        payload = json.loads(env.run("list", "--json").stdout)
+        meta = read_json(env.state / "openai-codex-accounts" / "accounts.json")
+        snap = read_json(env.state / "openai-codex-accounts" / "profiles" / "account2.json")
+
+        require(payload["active"] == "account2", f"same email should keep existing account2 active, got {payload}")
+        require(sorted(meta["accounts"].keys()) == ["account1", "account2", "account3"], f"same email must not create duplicates: {meta}")
+        require(meta["accounts"]["account2"]["accountId"] == "acct-beta-2", f"same email should refresh accountId/team: {meta}")
+        require(snap["accountId"] == "acct-beta-2", "snapshot should refresh to latest same-email accountId")
+        require(snap["access"] == refreshed_beta["access"], "snapshot should refresh to latest same-email token")
+
+        capture = env.run("capture", "renamed-beta")
+        meta_after_capture = read_json(env.state / "openai-codex-accounts" / "accounts.json")
+        require("现有账号快照: account2" in capture.stdout, f"capture should upsert existing same-email slot, got {capture.stdout}")
+        require(sorted(meta_after_capture["accounts"].keys()) == ["account1", "account2", "account3"], f"capture same email must not create duplicates: {meta_after_capture}")
+    finally:
+        env.cleanup()
+
+
+def test_list_prunes_stale_config_and_auth_aliases() -> None:
+    env = TestEnv()
+    try:
+        env.build_fixture()
+        cfg_path = env.state / "openclaw.json"
+        cfg = read_json(cfg_path)
+        cfg.setdefault("auth", {}).setdefault("profiles", {})["openai-codex:stale@example.com"] = {
+            "provider": "openai-codex",
+            "mode": "oauth",
+            "email": "stale@example.com",
+        }
+        cfg.setdefault("auth", {}).setdefault("order", {}).setdefault("openai-codex", []).append("openai-codex:stale@example.com")
+        write_json(cfg_path, cfg)
+
+        stale_profile = {
+            "type": "oauth",
+            "provider": "openai-codex",
+            "access": make_jwt("stale@example.com", "acct-stale", "user-stale"),
+            "refresh": "refresh-stale",
+            "accountId": "acct-stale",
+            "expires": 2_000_000_001_333,
+        }
+        for agent_id in ("main", "worker"):
+            path = env.state / "agents" / agent_id / "agent" / "auth-profiles.json"
+            store = read_json(path)
+            store.setdefault("profiles", {})["openai-codex:stale@example.com"] = stale_profile
+            write_json(path, store)
+
+        env.run("list", "--json")
+        cfg_after = read_json(cfg_path)
+        main_after = read_json(env.state / "agents" / "main" / "agent" / "auth-profiles.json")
+        worker_after = read_json(env.state / "agents" / "worker" / "agent" / "auth-profiles.json")
+
+        require("openai-codex:stale@example.com" not in (cfg_after.get("auth", {}).get("profiles", {}) or {}), f"stale config alias should be pruned: {cfg_after}")
+        require("openai-codex:stale@example.com" not in ((cfg_after.get("auth", {}).get("order", {}) or {}).get("openai-codex", [])), f"stale auth.order alias should be pruned: {cfg_after}")
+        require("openai-codex:stale@example.com" not in (main_after.get("profiles", {}) or {}), f"stale main auth alias should be pruned: {main_after}")
+        require("openai-codex:stale@example.com" not in (worker_after.get("profiles", {}) or {}), f"stale worker auth alias should be pruned: {worker_after}")
+    finally:
+        env.cleanup()
+
+
 def test_sensitive_files_use_restricted_permissions() -> None:
     env = TestEnv()
     try:
         env.build_fixture()
+        new_profile = {
+            "type": "oauth",
+            "provider": "openai-codex",
+            "access": make_jwt("secure@example.com", "acct-secure", "user-secure"),
+            "refresh": "refresh-secure",
+            "accountId": "acct-secure",
+            "expires": 2_000_000_001_222,
+        }
+        main_store_path = env.state / "agents" / "main" / "agent" / "auth-profiles.json"
+        worker_store_path = env.state / "agents" / "worker" / "agent" / "auth-profiles.json"
+        main_store = read_json(main_store_path)
+        worker_store = read_json(worker_store_path)
+        main_store["profiles"]["openai-codex:default"] = new_profile
+        worker_store["profiles"]["openai-codex:default"] = new_profile
+        write_json(main_store_path, main_store)
+        write_json(worker_store_path, worker_store)
+
         env.run("capture", "account4")
         snapshot = env.state / "openai-codex-accounts" / "profiles" / "account4.json"
         meta = env.state / "openai-codex-accounts" / "accounts.json"
@@ -491,6 +828,12 @@ def main() -> int:
         test_use_preserves_metadata_and_syncs_agents,
         test_auto_switches_best_account_and_keep_current,
         test_probe_forces_fresh_quota_refresh,
+        test_auto_blocks_switch_when_recent_sessions_are_active,
+        test_auto_forces_immediate_switch_at_hard_five_hour_threshold,
+        test_auto_forces_immediate_switch_at_hard_weekly_threshold,
+        test_sync_new_email_same_account_id_auto_enrolls_new_account,
+        test_sync_same_email_updates_existing_account_without_duplicate,
+        test_list_prunes_stale_config_and_auth_aliases,
         test_sensitive_files_use_restricted_permissions,
     ]
     failures: list[str] = []

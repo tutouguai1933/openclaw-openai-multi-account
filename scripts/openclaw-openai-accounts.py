@@ -301,36 +301,103 @@ def snapshot_profile(name: str) -> dict[str, Any] | None:
         return None
 
 
+def account_identity_from_info(name: str, info: dict[str, Any] | None) -> tuple[str | None, str | None, str | None]:
+    prof = snapshot_profile(name)
+    email = (info or {}).get('email')
+    account = (info or {}).get('accountId')
+    access = None
+    if prof:
+        access = prof.get('access')
+        prof_email, prof_account = profile_identity(prof)
+        email = prof_email or email
+        account = prof_account or account
+    return email, account, access
+
+
+def find_account_name_by_email(meta: dict[str, Any], email: str | None) -> str | None:
+    if not email:
+        return None
+    candidates: list[tuple[int, str]] = []
+    for name, info in sorted((meta.get('accounts') or {}).items()):
+        candidate_email, _, _ = account_identity_from_info(name, info)
+        if candidate_email == email:
+            saved_at = int((info or {}).get('savedAt') or 0)
+            candidates.append((saved_at, name))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def upsert_account_snapshot(meta: dict[str, Any], name: str, profile: dict[str, Any], *, saved_at: int | None = None, auto_discovered: bool | None = None) -> dict[str, Any]:
+    accounts = meta.setdefault('accounts', {})
+    identity = current_identity(profile)
+    sp = snapshot_path(name)
+    write_json_atomic(sp, profile, mode=0o600)
+    existing = dict(accounts.get(name, {}))
+    entry = {
+        **existing,
+        **identity,
+        'savedAt': int(existing.get('savedAt') or saved_at or time.time()),
+        'snapshot': str(sp),
+        'profileId': profile_id_for_profile(profile),
+    }
+    if auto_discovered is not None:
+        entry['autoDiscovered'] = auto_discovered
+    accounts[name] = entry
+    return entry
+
+
+def sync_profile_into_list(meta: dict[str, Any], profile: dict[str, Any], *, preferred_name: str | None = None, set_active: bool = True, auto_discovered: bool | None = None) -> dict[str, Any]:
+    identity = current_identity(profile)
+    email = identity.get('email')
+    existing_name = find_account_name_by_email(meta, email)
+
+    if existing_name:
+        target_name = existing_name
+        action = 'updated-existing'
+    else:
+        target_name = preferred_name or next_account_name(meta)
+        info = meta.get('accounts', {}).get(target_name, {})
+        existing_email = (info or {}).get('email')
+        if existing_email and email and existing_email != email:
+            raise SystemExit(f"❌ 账号名已被其他邮箱占用: {target_name} ({existing_email})")
+        action = 'created-new'
+
+    upsert_account_snapshot(meta, target_name, profile, auto_discovered=auto_discovered)
+    if set_active:
+        meta['active'] = target_name
+    reconcile_related_auth_state(meta, live_profile=profile)
+    return {
+        'name': target_name,
+        'email': email,
+        'action': action,
+        'isNew': action == 'created-new',
+    }
+
+
 def resolve_actual_active_name() -> str | None:
     actual = current_profile()
     if not actual:
         return None
     meta = load_meta()
-    actual_email, actual_account = profile_identity(actual)
+    actual_email, _ = profile_identity(actual)
     actual_access = actual.get('access')
     candidates: list[tuple[int, int, str]] = []
 
     for name, info in sorted((meta.get('accounts') or {}).items()):
-        prof = snapshot_profile(name)
-        email = (info or {}).get('email')
-        account = (info or {}).get('accountId')
-        access = None
-        if prof:
-            access = prof.get('access')
-            prof_email, prof_account = profile_identity(prof)
-            email = prof_email or email
-            account = prof_account or account
+        email, _, access = account_identity_from_info(name, info)
 
         score = -1
-        # Exact live access-token match is the strongest signal.
-        if actual_access and access == actual_access:
+        # Account identity is keyed by email. accountId can change when the same
+        # human moves to a new workspace/team, so accountId-only matches must
+        # never collapse distinct emails into one saved account.
+        if actual_email and email == actual_email and actual_access and access == actual_access:
             score = 400
-        elif actual_email and actual_account and email == actual_email and account == actual_account:
-            score = 300
         elif actual_email and email == actual_email:
+            score = 300
+        elif (not actual_email) and actual_access and access == actual_access:
             score = 200
-        elif actual_account and account == actual_account:
-            score = 100
 
         if score >= 0:
             saved_at = int((info or {}).get('savedAt') or 0)
@@ -357,8 +424,7 @@ def next_account_name(meta: dict[str, Any]) -> str:
     return f'account{n}'
 
 
-def sync_meta_with_reality() -> dict[str, Any]:
-    meta = load_meta()
+def repair_meta_metadata(meta: dict[str, Any]) -> dict[str, Any]:
     accounts = meta.setdefault('accounts', {})
     # Repair snapshot path fields and migrate old ambiguous profileId=default
     # metadata to stable email-specific profile ids.
@@ -372,33 +438,164 @@ def sync_meta_with_reality() -> dict[str, Any]:
         if ident.get('accountId') and not info.get('accountId'):
             info['accountId'] = ident.get('accountId')
         info['profileId'] = email_profile_id_for_snapshot(info, prof)
+    return meta
+
+
+def desired_openai_email_profiles(meta: dict[str, Any], live_profile: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    desired: dict[str, dict[str, Any]] = {}
+    for name, info in sorted((meta.get('accounts') or {}).items()):
+        prof = snapshot_profile(name)
+        email = (info or {}).get('email') or current_identity(prof).get('email')
+        profile_id = email_profile_id_for_snapshot(info, prof)
+        if profile_id != CANONICAL_PROFILE and email:
+            desired[profile_id] = {
+                'email': email,
+                'profile': prof,
+                'accountName': name,
+                'savedAt': int((info or {}).get('savedAt') or 0),
+            }
+    if live_profile:
+        live_ident = current_identity(live_profile)
+        live_email = live_ident.get('email')
+        live_profile_id = profile_id_for_profile(live_profile)
+        if live_profile_id != CANONICAL_PROFILE and live_email:
+            desired[live_profile_id] = {
+                'email': live_email,
+                'profile': live_profile,
+                'accountName': meta.get('active'),
+                'savedAt': int(time.time()),
+            }
+    return desired
+
+
+def desired_openai_profile_order(meta: dict[str, Any], desired: dict[str, dict[str, Any]], existing_order: list[str] | None = None) -> list[str]:
+    desired_ids = list(desired.keys())
+    if not desired_ids:
+        return [CANONICAL_PROFILE]
+
+    active_alias = None
+    active_name = meta.get('active')
+    active_info = (meta.get('accounts', {}) or {}).get(active_name or '', {}) if active_name else {}
+    if active_info:
+        active_alias = email_profile_id_for_snapshot(active_info, snapshot_profile(active_name))
+        if active_alias == CANONICAL_PROFILE:
+            active_alias = None
+
+    ordered = [CANONICAL_PROFILE]
+    if active_alias and active_alias in desired and active_alias not in ordered:
+        ordered.append(active_alias)
+
+    for pid in (existing_order or []):
+        if pid in desired and pid not in ordered:
+            ordered.append(pid)
+
+    remaining = [
+        (int((desired.get(pid) or {}).get('savedAt') or 0), pid)
+        for pid in desired_ids
+        if pid not in ordered
+    ]
+    for _, pid in sorted(remaining, key=lambda item: (item[0], item[1])):
+        ordered.append(pid)
+    return ordered
+
+
+def reconcile_main_auth_config(meta: dict[str, Any], live_profile: dict[str, Any] | None = None) -> None:
+    cfg = load_main_config()
+    auth = cfg.setdefault('auth', {})
+    profiles = auth.setdefault('profiles', {})
+    if not isinstance(profiles, dict):
+        profiles = {}
+        auth['profiles'] = profiles
+    desired = desired_openai_email_profiles(meta, live_profile=live_profile)
+    desired_ids = set(desired.keys())
+
+    profiles[CANONICAL_PROFILE] = {
+        'provider': 'openai-codex',
+        'mode': 'oauth',
+    }
+    for profile_id, entry in desired.items():
+        profiles[profile_id] = {
+            'provider': 'openai-codex',
+            'mode': 'oauth',
+            'email': entry.get('email'),
+        }
+
+    for profile_id in list(profiles.keys()):
+        if not isinstance(profile_id, str):
+            continue
+        if not profile_id.startswith('openai-codex:'):
+            continue
+        if profile_id == CANONICAL_PROFILE:
+            continue
+        if profile_id not in desired_ids:
+            del profiles[profile_id]
+
+    order = auth.setdefault('order', {})
+    if not isinstance(order, dict):
+        order = {}
+        auth['order'] = order
+    existing_order = order.get('openai-codex') if isinstance(order.get('openai-codex'), list) else []
+    order['openai-codex'] = desired_openai_profile_order(meta, desired, existing_order=existing_order)
+    save_main_config(cfg)
+
+
+def reconcile_agent_auth_store(path: Path, meta: dict[str, Any], live_profile: dict[str, Any] | None = None) -> None:
+    obj = load_auth_store(path) or {'version': 1, 'profiles': {}}
+    profiles = obj.setdefault('profiles', {})
+    if not isinstance(profiles, dict):
+        profiles = {}
+        obj['profiles'] = profiles
+
+    desired = desired_openai_email_profiles(meta, live_profile=live_profile)
+    desired_ids = set(desired.keys())
+
+    if live_profile:
+        profiles[CANONICAL_PROFILE] = live_profile
+
+    for profile_id, entry in desired.items():
+        prof = entry.get('profile')
+        if isinstance(prof, dict):
+            profiles[profile_id] = prof
+
+    for profile_id in list(profiles.keys()):
+        if not isinstance(profile_id, str):
+            continue
+        if not profile_id.startswith('openai-codex:'):
+            continue
+        if profile_id == CANONICAL_PROFILE:
+            continue
+        if profile_id not in desired_ids:
+            del profiles[profile_id]
+
+    write_json_atomic(path, obj, mode=0o600)
+
+
+def reconcile_related_auth_state(meta: dict[str, Any], live_profile: dict[str, Any] | None = None) -> dict[str, Any]:
+    meta = repair_meta_metadata(meta)
+    save_meta(meta)
+    reconcile_main_auth_config(meta, live_profile=live_profile)
+    for aid in configured_agents():
+        reconcile_agent_auth_store(auth_file_for_agent(aid), meta, live_profile=live_profile)
+    return meta
+
+
+def sync_meta_with_reality() -> dict[str, Any]:
+    meta = repair_meta_metadata(load_meta())
 
     actual = current_profile()
     if not actual:
-        save_meta(meta)
-        return meta
+        return reconcile_related_auth_state(meta)
 
     actual_name = resolve_actual_active_name()
     if actual_name:
+        upsert_account_snapshot(meta, actual_name, actual)
         meta['active'] = actual_name
-        save_meta(meta)
-        return meta
+        return reconcile_related_auth_state(meta, live_profile=actual)
 
-    # Real auth exists but is not in list yet: auto-enroll it.
-    ident = current_identity(actual)
-    new_name = next_account_name(meta)
-    sp = snapshot_path(new_name)
-    write_json_atomic(sp, actual, mode=0o600)
-    accounts[new_name] = {
-        **ident,
-        'savedAt': int(time.time()),
-        'snapshot': str(sp),
-        'profileId': profile_id_for_profile(actual),
-        'autoDiscovered': True,
-    }
-    meta['active'] = new_name
-    save_meta(meta)
-    return meta
+    # Real auth exists but is not in list yet: sync the current live login into
+    # the list. Only a brand-new email should allocate a new account slot.
+    sync_profile_into_list(meta, actual, auto_discovered=True)
+    return repair_meta_metadata(load_meta())
 
 
 def quota_cache_file(name: str) -> Path:
@@ -642,24 +839,18 @@ def cmd_list(verbose: bool = False, json_mode: bool = False, probe: bool = False
         print(" | ".join(parts))
 
 
-def capture_current(name: str, set_active: bool = True) -> None:
+def capture_current(name: str, set_active: bool = True, emit: bool = True) -> dict[str, Any]:
     profile = current_profile()
     if not profile:
         raise SystemExit("❌ 当前没有可保存的 OpenClaw OpenAI Codex OAuth profile")
-    identity = current_identity(profile)
-    email_profile_id = profile_id_for_profile(profile)
-    write_json_atomic(snapshot_path(name), profile, mode=0o600)
-    meta = sync_meta_with_reality()
-    meta.setdefault("accounts", {})[name] = {
-        **identity,
-        "savedAt": int(time.time()),
-        "snapshot": str(snapshot_path(name)),
-        "profileId": email_profile_id,
-    }
-    if set_active:
-        meta["active"] = name
-    save_meta(meta)
-    print(f"✅ 已保存账号快照: {name} ({identity.get('email') or 'unknown'})")
+    meta = repair_meta_metadata(load_meta())
+    result = sync_profile_into_list(meta, profile, preferred_name=name, set_active=set_active, auto_discovered=False)
+    if emit:
+        if result.get('action') == 'updated-existing':
+            print(f"✅ 邮箱 {result.get('email') or 'unknown'} 已存在，已更新现有账号快照: {result.get('name')}")
+        else:
+            print(f"✅ 已保存账号快照: {result.get('name')} ({result.get('email') or 'unknown'})")
+    return result
 
 
 def cmd_add(name: str | None, set_default_model: str | None) -> None:
@@ -670,8 +861,11 @@ def cmd_add(name: str | None, set_default_model: str | None) -> None:
     profile = current_profile()
     ident = current_identity(profile)
     guessed = name or ((ident.get("email") or "account").split('@', 1)[0])
-    capture_current(guessed, set_active=True)
-    print(f"✅ 已收录账号 {guessed}（沿用官方 auth login 产生的 profile 选择）")
+    result = capture_current(guessed, set_active=True, emit=False)
+    if result.get('action') == 'updated-existing':
+        print(f"✅ 已检测到当前登录账号 {result.get('email') or 'unknown'}，并更新现有账号 {result.get('name')}（沿用官方 auth login 产生的 profile 选择）")
+    else:
+        print(f"✅ 已检测到当前登录账号 {result.get('email') or 'unknown'}，并新增账号 {result.get('name')}（沿用官方 auth login 产生的 profile 选择）")
 
 
 def cmd_use(name: str, model: str = "openai-codex/gpt-5.4", verify: bool = True, emit: bool = True) -> dict[str, Any]:
@@ -694,7 +888,7 @@ def cmd_use(name: str, model: str = "openai-codex/gpt-5.4", verify: bool = True,
         'profileId': email_profile_id,
     })
     meta["active"] = name
-    save_meta(meta)
+    reconcile_related_auth_state(meta, live_profile=profile)
     set_model_silently(model)
     quota = best_effort_quota_for_identity(name, email, profile=profile)
     msg = f"✅ 已切换到 {name} ({email}) | selected_profile={CANONICAL_PROFILE} | email_profile={email_profile_id} | {quota_summary_text(quota)} | model={model}"
@@ -777,6 +971,36 @@ def quota_is_usable(quota: dict[str, Any] | None, five_hour_switch_at: float, we
     return float(five) < float(five_hour_switch_at) and float(week) < float(weekly_switch_at)
 
 
+def quota_hits_hard_five_hour_limit(quota: dict[str, Any] | None, hard_five_hour_switch_at: float) -> bool:
+    if not quota:
+        return False
+    health = quota.get('health', {}) if isinstance(quota, dict) else {}
+    if health.get('status') in {'auth-invalid', 'plan-unavailable'}:
+        return False
+    five = quota.get('fiveHourUsedPct')
+    if five is None:
+        return False
+    try:
+        return float(five) >= float(hard_five_hour_switch_at)
+    except Exception:
+        return False
+
+
+def quota_hits_hard_weekly_limit(quota: dict[str, Any] | None, hard_weekly_switch_at: float) -> bool:
+    if not quota:
+        return False
+    health = quota.get('health', {}) if isinstance(quota, dict) else {}
+    if health.get('status') in {'auth-invalid', 'plan-unavailable'}:
+        return False
+    week = quota.get('weeklyUsedPct')
+    if week is None:
+        return False
+    try:
+        return float(week) >= float(hard_weekly_switch_at)
+    except Exception:
+        return False
+
+
 def quota_left_pct(value: Any) -> Any:
     if value is None:
         return 'unknown'
@@ -807,7 +1031,64 @@ def set_model_silently(model: str) -> int:
     return int(cp.returncode)
 
 
-def cmd_auto(primary_model: str = "openai-codex/gpt-5.4", fallback_model: str = DEFAULT_FALLBACK_MODEL, json_mode: bool = False, notify_mode: bool = False, five_hour_switch_at: float = 85.0, weekly_switch_at: float = 90.0) -> dict[str, Any]:
+def list_recent_active_sessions(active_minutes: float) -> list[dict[str, Any]]:
+    if active_minutes <= 0:
+        return []
+    now_ms = int(time.time() * 1000)
+    threshold_ms = int(float(active_minutes) * 60 * 1000)
+    rows: list[dict[str, Any]] = []
+    for aid in configured_agents():
+        store_path = AGENTS_DIR / aid / 'sessions' / 'sessions.json'
+        if not store_path.exists():
+            continue
+        try:
+            store = json.loads(store_path.read_text())
+        except Exception:
+            continue
+        if not isinstance(store, dict):
+            continue
+        for key, info in store.items():
+            if not isinstance(info, dict):
+                continue
+            key_str = str(key)
+            # Ignore automation lanes; the guard is meant to protect human/user
+            # conversations from mid-flight model/account switches.
+            if ':cron:' in key_str or key_str.startswith('cron:'):
+                continue
+            updated_at = info.get('updatedAt')
+            try:
+                updated_at_ms = int(updated_at)
+            except Exception:
+                continue
+            age_ms = now_ms - updated_at_ms
+            if age_ms < 0:
+                age_ms = 0
+            if age_ms <= threshold_ms:
+                rows.append({
+                    'agentId': aid,
+                    'key': key_str,
+                    'updatedAt': updated_at_ms,
+                    'ageMs': age_ms,
+                    'model': info.get('model'),
+                })
+    rows.sort(key=lambda row: row.get('updatedAt', 0), reverse=True)
+    return rows
+
+
+def summarize_active_sessions(rows: list[dict[str, Any]], limit: int = 3) -> str:
+    if not rows:
+        return 'none'
+    parts = []
+    for row in rows[:limit]:
+        age_min = round(float(row.get('ageMs', 0)) / 60000.0, 1)
+        parts.append(f"{row.get('key')}({age_min}m)")
+    extra = len(rows) - len(parts)
+    if extra > 0:
+        parts.append(f"+{extra} more")
+    return ', '.join(parts)
+
+
+def cmd_auto(primary_model: str = "openai-codex/gpt-5.4", fallback_model: str = DEFAULT_FALLBACK_MODEL, json_mode: bool = False, notify_mode: bool = False, five_hour_switch_at: float = 80.0, hard_five_hour_switch_at: float = 90.0, weekly_switch_at: float = 90.0, hard_weekly_switch_at: float = 95.0, inactive_minutes: float = 3.0) -> dict[str, Any]:
     meta = sync_meta_with_reality()
     accounts = meta.get("accounts", {})
     if not accounts:
@@ -827,6 +1108,12 @@ def cmd_auto(primary_model: str = "openai-codex/gpt-5.4", fallback_model: str = 
 
     active_name = meta.get("active")
     active_entry = next((x for x in scored if x[1] == active_name), None)
+    current_quota = active_entry[3] if active_entry else None
+    current_info = active_entry[2] if active_entry else {}
+    hard_five_hour_required = quota_hits_hard_five_hour_limit(current_quota, hard_five_hour_switch_at)
+    hard_weekly_required = quota_hits_hard_weekly_limit(current_quota, hard_weekly_switch_at)
+    hard_switch_required = hard_five_hour_required or hard_weekly_required
+
     if active_entry is not None:
         _, name, info, quota = active_entry
         if quota_is_usable(quota, five_hour_switch_at, weekly_switch_at):
@@ -838,6 +1125,10 @@ def cmd_auto(primary_model: str = "openai-codex/gpt-5.4", fallback_model: str = 
                 "fiveHourUsedPct": quota.get("fiveHourUsedPct") if quota else None,
                 "weeklyUsedPct": quota.get("weeklyUsedPct") if quota else None,
                 "model": primary_model,
+                "softFiveHourSwitchAt": five_hour_switch_at,
+                "hardFiveHourSwitchAt": hard_five_hour_switch_at,
+                "softWeeklySwitchAt": weekly_switch_at,
+                "hardWeeklySwitchAt": hard_weekly_switch_at,
                 "message": f"当前账号 {name} ({info.get('email')}) 仍可用，{quota_summary_text(quota)}，继续使用 {primary_model}",
             }
             if json_mode:
@@ -845,6 +1136,29 @@ def cmd_auto(primary_model: str = "openai-codex/gpt-5.4", fallback_model: str = 
             elif notify_mode:
                 print(result["message"])
             return result
+
+    recent_active_sessions = list_recent_active_sessions(inactive_minutes)
+    if recent_active_sessions and not hard_switch_required:
+        result = {
+            "mode": "blocked-active-sessions",
+            "activeAccount": active_name,
+            "email": current_info.get("email") if isinstance(current_info, dict) else None,
+            "fiveHourUsedPct": current_quota.get("fiveHourUsedPct") if current_quota else None,
+            "weeklyUsedPct": current_quota.get("weeklyUsedPct") if current_quota else None,
+            "inactiveMinutesRequired": inactive_minutes,
+            "softFiveHourSwitchAt": five_hour_switch_at,
+            "hardFiveHourSwitchAt": hard_five_hour_switch_at,
+            "softWeeklySwitchAt": weekly_switch_at,
+            "hardWeeklySwitchAt": hard_weekly_switch_at,
+            "activeSessionCount": len(recent_active_sessions),
+            "activeSessionExamples": recent_active_sessions[:3],
+            "message": f"检测到最近 {inactive_minutes:g} 分钟内仍有 {len(recent_active_sessions)} 个活跃 session（{summarize_active_sessions(recent_active_sessions)}），当前仅达到软切换条件（5小时或每周额度），为避免打断对话，本次暂不切换账号/模型。",
+        }
+        if json_mode:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif notify_mode:
+            print(result["message"])
+        return result
 
     usable = [x for x in scored if quota_is_usable(x[3], five_hour_switch_at, weekly_switch_at)]
     if usable:
@@ -858,6 +1172,19 @@ def cmd_auto(primary_model: str = "openai-codex/gpt-5.4", fallback_model: str = 
             "fiveHourUsedPct": quota.get("fiveHourUsedPct"),
             "weeklyUsedPct": quota.get("weeklyUsedPct"),
             "model": primary_model,
+            "inactiveMinutesRequired": inactive_minutes,
+            "softFiveHourSwitchAt": five_hour_switch_at,
+            "hardFiveHourSwitchAt": hard_five_hour_switch_at,
+            "softWeeklySwitchAt": weekly_switch_at,
+            "hardWeeklySwitchAt": hard_weekly_switch_at,
+            "forcedImmediate": hard_switch_required,
+            "forcedBy": (
+                "five-hour"
+                if hard_five_hour_required
+                else "weekly"
+                if hard_weekly_required
+                else None
+            ),
             "message": f"已切换到账号 {name} ({info.get('email')})，{quota_summary_text(quota)}，当前模型 {primary_model}",
         }
         if json_mode:
@@ -867,11 +1194,36 @@ def cmd_auto(primary_model: str = "openai-codex/gpt-5.4", fallback_model: str = 
         return result
 
     set_model_silently(fallback_model)
+    reason = "all accounts exhausted or quota unknown"
+    hard_reason_label = None
+    if hard_five_hour_required:
+        reason = "hard-five-hour-threshold-reached"
+        hard_reason_label = f"5 小时用量已触发硬切换阈值（>= {hard_five_hour_switch_at:g}%）"
+    elif hard_weekly_required:
+        reason = "hard-weekly-threshold-reached"
+        hard_reason_label = f"每周用量已触发硬切换阈值（>= {hard_weekly_switch_at:g}%）"
     result = {
         "mode": "fallback-model",
-        "reason": "all accounts exhausted or quota unknown",
+        "reason": reason,
         "fallbackModel": fallback_model,
-        "message": f"所有 OpenAI 账号都不适合继续使用（达到阈值或额度未知），已切换到备选模型 {fallback_model}",
+        "inactiveMinutesRequired": inactive_minutes,
+        "softFiveHourSwitchAt": five_hour_switch_at,
+        "hardFiveHourSwitchAt": hard_five_hour_switch_at,
+        "softWeeklySwitchAt": weekly_switch_at,
+        "hardWeeklySwitchAt": hard_weekly_switch_at,
+        "forcedImmediate": hard_switch_required,
+        "forcedBy": (
+            "five-hour"
+            if hard_five_hour_required
+            else "weekly"
+            if hard_weekly_required
+            else None
+        ),
+        "message": (
+            f"当前账号{hard_reason_label}，已立即切换到备选模型 {fallback_model}"
+            if hard_switch_required and hard_reason_label
+            else f"所有 OpenAI 账号都不适合继续使用（达到阈值或额度未知），且最近 {inactive_minutes:g} 分钟无活跃 session，已切换到备选模型 {fallback_model}"
+        ),
     }
     if json_mode:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -917,15 +1269,21 @@ def main() -> int:
     p.add_argument("--fallback-model", default=DEFAULT_FALLBACK_MODEL)
     p.add_argument("--json", action="store_true")
     p.add_argument("--notify", action="store_true")
-    p.add_argument("--five-hour-switch-at", type=float, default=85.0)
+    p.add_argument("--five-hour-switch-at", type=float, default=80.0)
+    p.add_argument("--five-hour-hard-switch-at", type=float, default=90.0)
     p.add_argument("--weekly-switch-at", type=float, default=90.0)
+    p.add_argument("--weekly-hard-switch-at", type=float, default=95.0)
+    p.add_argument("--inactive-minutes", type=float, default=3.0)
 
     p = sub.add_parser("cron-check")
     p.add_argument("--model", default="openai-codex/gpt-5.4")
     p.add_argument("--fallback-model", default=DEFAULT_FALLBACK_MODEL)
     p.add_argument("--json", action="store_true")
-    p.add_argument("--five-hour-switch-at", type=float, default=85.0)
+    p.add_argument("--five-hour-switch-at", type=float, default=80.0)
+    p.add_argument("--five-hour-hard-switch-at", type=float, default=90.0)
     p.add_argument("--weekly-switch-at", type=float, default=90.0)
+    p.add_argument("--weekly-hard-switch-at", type=float, default=95.0)
+    p.add_argument("--inactive-minutes", type=float, default=3.0)
 
     p = sub.add_parser("import-codex")
     p.add_argument("name")
@@ -943,9 +1301,9 @@ def main() -> int:
     elif args.cmd == "status":
         cmd_status(model=args.model, probe=args.probe)
     elif args.cmd == "auto":
-        cmd_auto(primary_model=args.model, fallback_model=args.fallback_model, json_mode=args.json, notify_mode=args.notify, five_hour_switch_at=args.five_hour_switch_at, weekly_switch_at=args.weekly_switch_at)
+        cmd_auto(primary_model=args.model, fallback_model=args.fallback_model, json_mode=args.json, notify_mode=args.notify, five_hour_switch_at=args.five_hour_switch_at, hard_five_hour_switch_at=args.five_hour_hard_switch_at, weekly_switch_at=args.weekly_switch_at, hard_weekly_switch_at=args.weekly_hard_switch_at, inactive_minutes=args.inactive_minutes)
     elif args.cmd == "cron-check":
-        result = cmd_auto(primary_model=args.model, fallback_model=args.fallback_model, json_mode=args.json, notify_mode=not args.json, five_hour_switch_at=args.five_hour_switch_at, weekly_switch_at=args.weekly_switch_at)
+        result = cmd_auto(primary_model=args.model, fallback_model=args.fallback_model, json_mode=args.json, notify_mode=not args.json, five_hour_switch_at=args.five_hour_switch_at, hard_five_hour_switch_at=args.five_hour_hard_switch_at, weekly_switch_at=args.weekly_switch_at, hard_weekly_switch_at=args.weekly_hard_switch_at, inactive_minutes=args.inactive_minutes)
         if args.json:
             return 0
         # human-readable single line for cron/system events

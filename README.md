@@ -29,7 +29,7 @@ This skill provides a practical operator workflow for managing those accounts sa
 - Inspect cached/observed **5-hour** and **weekly** quota
 - Auto-repair stale `ACTIVE` metadata
 - Auto-enroll newly logged-in accounts discovered from live OpenClaw auth
-- Auto-rotate between same-model accounts near exhaustion
+- Auto-rotate between same-model accounts near exhaustion with 5-hour/weekly soft+hard thresholds
 - Fall back to a backup model when all OpenAI accounts are unavailable
 
 ## Repository layout
@@ -74,6 +74,20 @@ python3 scripts/openclaw-openai-accounts.py use work
 ```bash
 python3 scripts/openclaw-openai-accounts.py auto
 ```
+
+### 6) Recommended unattended policy
+
+```bash
+python3 scripts/openclaw-openai-accounts.py cron-check --inactive-minutes 3 --five-hour-switch-at 80 --five-hour-hard-switch-at 90 --weekly-switch-at 90 --weekly-hard-switch-at 95
+```
+
+Policy summary:
+
+- check every 10 minutes
+- at 5-hour usage 80%: switch only if all non-cron sessions have been inactive for 3 minutes
+- at 5-hour usage 90%: switch immediately
+- at weekly usage 90%: switch only if all non-cron sessions have been inactive for 3 minutes
+- at weekly usage 95%: switch immediately
 
 ## Typical use cases
 
