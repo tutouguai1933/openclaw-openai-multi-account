@@ -2,7 +2,7 @@
 
 [![Release](https://img.shields.io/github/v/release/tutouguai1933/openclaw-openai-multi-account?sort=semver)](https://github.com/tutouguai1933/openclaw-openai-multi-account/releases)
 [![Stars](https://img.shields.io/github/stars/tutouguai1933/openclaw-openai-multi-account?style=social)](https://github.com/tutouguai1933/openclaw-openai-multi-account/stargazers)
-[![License: Pending](https://img.shields.io/badge/license-pending-lightgrey)](./LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
 Manage **multiple OpenAI OAuth login accounts inside OpenClaw**, especially multiple `openai-codex` OAuth accounts, with snapshotting, switching, quota inspection, automatic rotation, and fallback handling.
 
